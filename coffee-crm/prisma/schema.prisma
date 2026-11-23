@@ -1,0 +1,551 @@
+// =============================================================================
+// Coffee CRM — database schema (DRAFT FOR APPROVAL)
+// =============================================================================
+//
+// Conventions (so the app can move from SQLite to PostgreSQL by changing only
+// the `provider` line and the connection string):
+//
+//   * MONEY is stored as whole minor units in an Int (e.g. cents, fils, pence).
+//     4.50 is stored as 450. No floating point anywhere near money.
+//   * QUANTITIES are Decimal so beans can be sold by weight (0.250 kg).
+//   * "Enum" fields are plain Strings validated by the app (see the comment on
+//     each field for the allowed values). This keeps SQLite and Postgres
+//     identical; they can become native Postgres enums later if wanted.
+//   * Rows that matter for history (products, customers, suppliers, users) are
+//     deactivated, never deleted, so old receipts and reports stay correct.
+//   * Sale and purchase lines SNAPSHOT name/price/cost at the time of the
+//     transaction, so later price edits never rewrite history.
+//
+// THE STOCK RULE: StockMovement is the single ledger for every stock change.
+// StockLevel is a cached running total per product per branch, updated in the
+// SAME database transaction as the movement. A reconcile check can rebuild
+// StockLevel from the ledger at any time and the numbers must match.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite" // switch to "postgresql" later
+}
+
+// -----------------------------------------------------------------------------
+// Settings & organisation
+// -----------------------------------------------------------------------------
+
+/// Single row (id = 1) holding business-wide settings.
+model Setting {
+  id                 Int      @id @default(1)
+  businessName       String
+  legalName          String?
+  taxNumber          String?
+  address            String?
+  phone              String?
+  email              String?
+  logoPath           String?
+  currencyCode       String   @default("USD") // ISO 4217, e.g. USD, EUR, AED, MAD
+  currencyDecimals   Int      @default(2)
+  taxRateBps         Int      @default(0) // basis points: 1500 = 15.00 %
+  pricesIncludeTax   Boolean  @default(true)
+  allowNegativeStock Boolean  @default(false)
+  receiptFooter      String?
+  // Loyalty: points earned per 1 whole currency unit spent, and value of a point
+  loyaltyEarnRate    Decimal  @default(1)
+  loyaltyPointValue  Int      @default(1) // minor units per point when redeemed
+  // Customer segment rules
+  vipSpendThreshold  Int      @default(100000) // minor units spent in last 365 days
+  newCustomerDays    Int      @default(30)
+  inactiveAfterDays  Int      @default(90)
+  updatedAt          DateTime @updatedAt
+}
+
+model Branch {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  code      String   @unique // short code used in document numbers, e.g. "MAIN"
+  address   String?
+  phone     String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  users          User[]
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
+  sales          Sale[]
+  purchases      Purchase[]
+  audits         StockAudit[]
+  expenses       Expense[]
+}
+
+// -----------------------------------------------------------------------------
+// Users, sessions, activity
+// -----------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  passwordHash String // bcrypt
+  role         String // OWNER | MANAGER | STAFF
+  branchId     String? // staff/managers can be pinned to one branch; null = all
+  branch       Branch?   @relation(fields: [branchId], references: [id])
+  active       Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions         Session[]
+  activities       ActivityLog[]
+  sales            Sale[]
+  refunds          Refund[]
+  purchases        Purchase[]
+  supplierPayments SupplierPayment[]
+  stockMovements   StockMovement[]
+  auditsStarted    StockAudit[]      @relation("AuditStartedBy")
+  auditsApproved   StockAudit[]      @relation("AuditApprovedBy")
+  expenses         Expense[]
+  customerNotes    CustomerNote[]
+}
+
+/// Server-side login sessions. The browser holds only a random token in an
+/// HTTP-only cookie; we store its SHA-256 hash. Deactivating a user deletes
+/// their sessions, logging them out everywhere immediately.
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+/// Append-only "who did what and when".
+model ActivityLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String // e.g. "sale.create", "product.update", "audit.approve", "auth.login"
+  entityType String? // e.g. "Sale"
+  entityId   String?
+  summary    String // human readable: "Created sale S-MAIN-000123 (45.50)"
+  metadata   String? // JSON text (before/after values etc.)
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([userId, createdAt])
+}
+
+/// Gap-free, per-branch document numbers (S-MAIN-000123, PO-MAIN-000045 ...).
+model DocumentSequence {
+  key  String @id // e.g. "SALE:MAIN"
+  next Int    @default(1)
+}
+
+// -----------------------------------------------------------------------------
+// Catalogue
+// -----------------------------------------------------------------------------
+
+model Category {
+  id        String    @id @default(cuid())
+  name      String    @unique // Beans, Ground Coffee, Capsules, Equipment, Drinks ...
+  sortOrder Int       @default(0)
+  active    Boolean   @default(true)
+  products  Product[]
+}
+
+model Product {
+  id           String   @id @default(cuid())
+  sku          String   @unique
+  barcode      String?  @unique
+  name         String
+  description  String?
+  categoryId   String
+  category     Category @relation(fields: [categoryId], references: [id])
+  unit         String // KG | BAG | PIECE | BOX | CUP
+  costPrice    Int // default / last purchase cost per unit, minor units
+  sellingPrice Int // per unit, minor units
+  reorderLevel Decimal  @default(0) // low-stock threshold (applies per branch)
+  trackStock   Boolean  @default(true) // false for made-to-order drinks
+  active       Boolean  @default(true)
+  photoPath    String? // stored under data/uploads, served by a route handler
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  stockLevels    StockLevel[]
+  stockMovements StockMovement[]
+  saleItems      SaleItem[]
+  purchaseItems  PurchaseItem[]
+  auditItems     StockAuditItem[]
+
+  @@index([categoryId])
+  @@index([name])
+}
+
+// -----------------------------------------------------------------------------
+// Stock: ledger + cached levels
+// -----------------------------------------------------------------------------
+
+/// Cached on-hand quantity and weighted-average cost per product per branch.
+/// ONLY the stock service writes to this table, and only together with a
+/// StockMovement row.
+model StockLevel {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  branchId  String
+  branch    Branch   @relation(fields: [branchId], references: [id])
+  quantity  Decimal  @default(0)
+  avgCost   Int      @default(0) // weighted average cost per unit, minor units
+  updatedAt DateTime @updatedAt
+
+  @@unique([productId, branchId])
+}
+
+/// THE LEDGER. Every change to stock is one row here. Never updated or deleted.
+model StockMovement {
+  id              String      @id @default(cuid())
+  productId       String
+  product         Product     @relation(fields: [productId], references: [id])
+  branchId        String
+  branch          Branch      @relation(fields: [branchId], references: [id])
+  // OPENING | PURCHASE | SALE | RETURN | ADJUSTMENT | AUDIT | WASTE
+  // | TRANSFER_IN | TRANSFER_OUT
+  type            String
+  quantity        Decimal // signed: +in, -out
+  unitCost        Int // cost per unit used for this movement, minor units
+  balanceAfter    Decimal // on-hand quantity after this movement
+  reason          String? // required for ADJUSTMENT, AUDIT, WASTE
+  // Source document (at most one set)
+  saleId          String?
+  sale            Sale?       @relation(fields: [saleId], references: [id])
+  refundId        String?
+  refund          Refund?     @relation(fields: [refundId], references: [id])
+  purchaseId      String?
+  purchase        Purchase?   @relation(fields: [purchaseId], references: [id])
+  auditId         String?
+  audit           StockAudit? @relation(fields: [auditId], references: [id])
+  transferGroupId String? // links the OUT and IN legs of a branch transfer
+  userId          String
+  user            User        @relation(fields: [userId], references: [id])
+  createdAt       DateTime    @default(now())
+
+  @@index([productId, branchId, createdAt])
+  @@index([branchId, createdAt])
+  @@index([type, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// Suppliers & purchases
+// -----------------------------------------------------------------------------
+
+model Supplier {
+  id          String     @id @default(cuid())
+  name        String     @unique
+  contactName String?
+  phone       String?
+  email       String?
+  address     String?
+  taxNumber   String?
+  notes       String?
+  active      Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  purchases   Purchase[]
+  // Outstanding balance = sum(purchase.total) - sum(purchase.amountPaid)
+  // for non-cancelled purchases; computed, not stored.
+}
+
+model Purchase {
+  id            String    @id @default(cuid())
+  number        String    @unique // PO-MAIN-000045
+  supplierId    String
+  supplier      Supplier  @relation(fields: [supplierId], references: [id])
+  branchId      String
+  branch        Branch    @relation(fields: [branchId], references: [id])
+  // DRAFT | ORDERED | PARTIALLY_RECEIVED | RECEIVED | CANCELLED
+  status        String    @default("DRAFT")
+  supplierRef   String? // supplier's invoice number
+  orderDate     DateTime  @default(now())
+  expectedDate  DateTime?
+  receivedAt    DateTime?
+  subtotal      Int       @default(0)
+  discount      Int       @default(0)
+  shipping      Int       @default(0)
+  tax           Int       @default(0)
+  total         Int       @default(0)
+  amountPaid    Int       @default(0) // kept in sync with SupplierPayment rows
+  paymentStatus String    @default("UNPAID") // UNPAID | PARTIAL | PAID
+  notes         String?
+  createdById   String
+  createdBy     User      @relation(fields: [createdById], references: [id])
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  items          PurchaseItem[]
+  payments       SupplierPayment[]
+  stockMovements StockMovement[]
+
+  @@index([supplierId, orderDate])
+  @@index([branchId, orderDate])
+}
+
+model PurchaseItem {
+  id               String   @id @default(cuid())
+  purchaseId       String
+  purchase         Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  productId        String
+  product          Product  @relation(fields: [productId], references: [id])
+  quantityOrdered  Decimal
+  quantityReceived Decimal  @default(0)
+  unitCost         Int
+  lineTotal        Int
+}
+
+model SupplierPayment {
+  id         String   @id @default(cuid())
+  purchaseId String
+  purchase   Purchase @relation(fields: [purchaseId], references: [id])
+  amount     Int
+  method     String // CASH | CARD | BANK_TRANSFER | CHEQUE | OTHER
+  paidAt     DateTime @default(now())
+  reference  String?
+  note       String?
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+}
+
+// -----------------------------------------------------------------------------
+// Customers (CRM)
+// -----------------------------------------------------------------------------
+
+model Customer {
+  id              String    @id @default(cuid())
+  name            String
+  phone           String?   @unique
+  email           String?   @unique
+  address         String?
+  birthday        DateTime?
+  marketingOptIn  Boolean   @default(false)
+  notes           String? // pinned/general note
+  active          Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  // Cached stats, maintained in the same transaction as sales/refunds
+  // (and rebuildable from Sale rows):
+  loyaltyPoints   Int       @default(0)
+  totalSpent      Int       @default(0)
+  orderCount      Int       @default(0)
+  firstPurchaseAt DateTime?
+  lastPurchaseAt  DateTime?
+  // Segment (NEW | REGULAR | VIP | INACTIVE) is CALCULATED from these fields
+  // and the thresholds in Setting, so it is never stale.
+
+  sales       Sale[]
+  loyaltyTxns LoyaltyTransaction[]
+  noteLog     CustomerNote[]
+
+  @@index([name])
+  @@index([lastPurchaseAt])
+}
+
+model CustomerNote {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  body       String
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  createdAt  DateTime @default(now())
+}
+
+model LoyaltyTransaction {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+  points     Int // signed
+  type       String // EARN | REDEEM | REVERSAL | MANUAL
+  saleId     String?
+  sale       Sale?    @relation(fields: [saleId], references: [id])
+  note       String?
+  createdAt  DateTime @default(now())
+}
+
+// -----------------------------------------------------------------------------
+// Sales, payments, refunds
+// -----------------------------------------------------------------------------
+
+model Sale {
+  id             String    @id @default(cuid())
+  number         String    @unique // S-MAIN-000123
+  branchId       String
+  branch         Branch    @relation(fields: [branchId], references: [id])
+  customerId     String?
+  customer       Customer? @relation(fields: [customerId], references: [id])
+  userId         String // cashier
+  user           User      @relation(fields: [userId], references: [id])
+  // COMPLETED | PARTIALLY_REFUNDED | REFUNDED | VOID
+  status         String    @default("COMPLETED")
+  subtotal       Int // sum of line totals before order discount
+  discountTotal  Int       @default(0) // order-level discount amount
+  discountNote   String?
+  taxTotal       Int       @default(0)
+  total          Int // amount the customer pays
+  costTotal      Int // cost of goods sold (snapshot) for profit reports
+  pointsEarned   Int       @default(0)
+  pointsRedeemed Int       @default(0)
+  refundedTotal  Int       @default(0)
+  notes          String?
+  createdAt      DateTime  @default(now())
+
+  items          SaleItem[]
+  payments       SalePayment[]
+  refunds        Refund[]
+  stockMovements StockMovement[]
+  loyaltyTxns    LoyaltyTransaction[]
+
+  @@index([branchId, createdAt])
+  @@index([customerId, createdAt])
+  @@index([createdAt])
+}
+
+model SaleItem {
+  id               String  @id @default(cuid())
+  saleId           String
+  sale             Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId        String
+  product          Product @relation(fields: [productId], references: [id])
+  productName      String // snapshot
+  sku              String // snapshot
+  unit             String // snapshot
+  quantity         Decimal
+  unitPrice        Int // snapshot selling price
+  discount         Int     @default(0) // line discount amount
+  lineTotal        Int // quantity * unitPrice - discount
+  unitCost         Int // snapshot weighted-average cost at time of sale
+  quantityRefunded Decimal @default(0)
+
+  refundItems RefundItem[]
+
+  @@index([productId])
+}
+
+/// One sale can be split across several payment methods.
+model SalePayment {
+  id       String @id @default(cuid())
+  saleId   String
+  sale     Sale   @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  method   String // CASH | CARD | MOBILE | BANK_TRANSFER | LOYALTY | OTHER
+  amount   Int
+  tendered Int? // cash handed over (for change calculation)
+}
+
+model Refund {
+  id        String   @id @default(cuid())
+  number    String   @unique // R-MAIN-000012
+  saleId    String
+  sale      Sale     @relation(fields: [saleId], references: [id])
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  reason    String
+  method    String // how money was returned: CASH | CARD | ...
+  total     Int
+  costTotal Int // COGS reversed (only for restocked items)
+  createdAt DateTime @default(now())
+
+  items          RefundItem[]
+  stockMovements StockMovement[]
+
+  @@index([createdAt])
+}
+
+model RefundItem {
+  id         String   @id @default(cuid())
+  refundId   String
+  refund     Refund   @relation(fields: [refundId], references: [id], onDelete: Cascade)
+  saleItemId String
+  saleItem   SaleItem @relation(fields: [saleItemId], references: [id])
+  quantity   Decimal
+  amount     Int
+  restocked  Boolean // true = goods back on shelf (RETURN movement); false = damaged
+}
+
+// -----------------------------------------------------------------------------
+// Stock audits
+// -----------------------------------------------------------------------------
+
+model StockAudit {
+  id           String    @id @default(cuid())
+  number       String    @unique // AUD-MAIN-000007
+  branchId     String
+  branch       Branch    @relation(fields: [branchId], references: [id])
+  // IN_PROGRESS | SUBMITTED | APPROVED | CANCELLED
+  status       String    @default("IN_PROGRESS")
+  scope        String? // null = all products; otherwise a category id
+  notes        String?
+  startedById  String
+  startedBy    User      @relation("AuditStartedBy", fields: [startedById], references: [id])
+  approvedById String?
+  approvedBy   User?     @relation("AuditApprovedBy", fields: [approvedById], references: [id])
+  startedAt    DateTime  @default(now())
+  submittedAt  DateTime?
+  approvedAt   DateTime?
+
+  items          StockAuditItem[]
+  stockMovements StockMovement[]
+
+  @@index([branchId, startedAt])
+}
+
+/// systemQty is snapshotted when the audit starts. On approval the variance
+/// (counted - systemQty) is posted as an AUDIT movement, so sales made while
+/// counting are not lost.
+model StockAuditItem {
+  id            String     @id @default(cuid())
+  auditId       String
+  audit         StockAudit @relation(fields: [auditId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product    @relation(fields: [productId], references: [id])
+  systemQty     Decimal
+  countedQty    Decimal? // null = not counted yet
+  varianceQty   Decimal? // counted - system
+  unitCost      Int // avgCost snapshot, to value the variance
+  varianceValue Int? // varianceQty * unitCost
+  reason        String? // required when variance != 0
+  countedAt     DateTime?
+
+  @@unique([auditId, productId])
+}
+
+// -----------------------------------------------------------------------------
+// Expenses
+// -----------------------------------------------------------------------------
+
+model ExpenseCategory {
+  id       String    @id @default(cuid())
+  name     String    @unique // Rent, Salaries, Utilities, Marketing, Maintenance, Other
+  active   Boolean   @default(true)
+  expenses Expense[]
+}
+
+model Expense {
+  id            String          @id @default(cuid())
+  date          DateTime
+  categoryId    String
+  category      ExpenseCategory @relation(fields: [categoryId], references: [id])
+  branchId      String? // null = shared across the business
+  branch        Branch?         @relation(fields: [branchId], references: [id])
+  amount        Int
+  description   String
+  vendor        String?
+  paymentMethod String?
+  userId        String
+  user          User            @relation(fields: [userId], references: [id])
+  createdAt     DateTime        @default(now())
+
+  @@index([date])
+  @@index([categoryId, date])
+}
