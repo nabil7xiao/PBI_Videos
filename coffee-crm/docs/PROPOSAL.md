@@ -1,4 +1,4 @@
-# Coffee CRM — Stage 0 proposal (awaiting approval)
+# Coffee CRM — Stage 0 proposal (APPROVED with defaults — see DECISIONS.md)
 
 Nothing has been built yet. This document covers the plan, the database schema,
 the folder structure and the open questions. Once you approve it (with any

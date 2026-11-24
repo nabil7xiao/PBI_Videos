@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+/* Coffee palette used across the app (bg-coffee-700, text-coffee-900, ...). */
+@theme {
+  --color-coffee-50: #faf6f2;
+  --color-coffee-100: #f1e7dc;
+  --color-coffee-200: #e2cdb8;
+  --color-coffee-300: #cfa985;
+  --color-coffee-400: #b9845a;
+  --color-coffee-500: #a26a40;
+  --color-coffee-600: #875433;
+  --color-coffee-700: #6b412a;
+  --color-coffee-800: #4f3020;
+  --color-coffee-900: #3b2416;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/* Printing (receipts, reports): hide navigation chrome. */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: white;
+  }
+}
